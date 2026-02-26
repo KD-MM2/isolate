@@ -1,12 +1,14 @@
 /*
  *	Process Isolator -- Rules
  *
- *	(c) 2012-2018 Martin Mares <mj@ucw.cz>
+ *	(c) 2012-2025 Martin Mares <mj@ucw.cz>
  *	(c) 2012-2014 Bernard Blackham <bernard@blackham.com.au>
  */
 
 #include "isolate.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <mntent.h>
 #include <stdio.h>
@@ -16,6 +18,7 @@
 #include <sys/mount.h>
 #include <sys/quota.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -464,42 +467,13 @@ apply_dir_rules(int with_defaults)
 
 /*** Disk quotas ***/
 
-static int
-path_begins_with(char *path, char *with)
+static void
+quotactl_error(void)
 {
-  while (*with)
-    if (*path++ != *with++)
-      return 0;
-  return (!*with || *with == '/');
-}
-
-static char *
-find_device(char *path)
-{
-  FILE *f = setmntent("/proc/mounts", "r");
-  if (!f)
-    die("Cannot open /proc/mounts: %m");
-
-  struct mntent *me;
-  int best_len = 0;
-  char *best_dev = NULL;
-  while (me = getmntent(f))
-    {
-      if (!path_begins_with(me->mnt_fsname, "/dev"))
-	continue;
-      if (path_begins_with(path, me->mnt_dir))
-	{
-	  int len = strlen(me->mnt_dir);
-	  if (len > best_len)
-	    {
-	      best_len = len;
-	      free(best_dev);
-	      best_dev = xstrdup(me->mnt_fsname);
-	    }
-	}
-    }
-  endmntent(f);
-  return best_dev;
+  // This errno has an outstandingly unhelpful message of "no such process".
+  if (errno == ESRCH)
+    die("Cannot set disk quota: quotas have not been enabled for this filesystem");
+  die("Cannot set disk quota: %m");
 }
 
 void
@@ -508,26 +482,6 @@ set_quota(void)
   if (!block_quota)
     return;
 
-  char cwd[PATH_MAX];
-  if (!getcwd(cwd, sizeof(cwd)))
-    die("getcwd: %m");
-
-  char *dev = find_device(cwd);
-  if (!dev)
-    die("Cannot identify filesystem which contains %s", cwd);
-  msg("Quota: Mapped path %s to a filesystem on %s\n", cwd, dev);
-
-  // Sanity check
-  struct stat dev_st, cwd_st;
-  if (stat(dev, &dev_st) < 0)
-    die("Cannot identify block device %s: %m", dev);
-  if (!S_ISBLK(dev_st.st_mode))
-    die("Expected that %s is a block device", dev);
-  if (stat(".", &cwd_st) < 0)
-    die("Cannot stat cwd: %m");
-  if (cwd_st.st_dev != dev_st.st_rdev)
-    die("Identified %s as a filesystem on %s, but it is obviously false", cwd, dev);
-
   struct dqblk dq = {
     .dqb_bhardlimit = block_quota,
     .dqb_bsoftlimit = block_quota,
@@ -535,9 +489,17 @@ set_quota(void)
     .dqb_isoftlimit = inode_quota,
     .dqb_valid = QIF_LIMITS,
   };
-  if (quotactl(QCMD(Q_SETQUOTA, USRQUOTA), dev, box_uid, (caddr_t) &dq) < 0)
-    die("Cannot set disk quota: %m");
-  msg("Quota: Set block quota %d and inode quota %d\n", block_quota, inode_quota);
+  void *dq_ptr = (void*)&dq;
+  int quota_op = QCMD(Q_SETQUOTA, USRQUOTA);
 
-  free(dev);
+  int cwd_fd = open(".", O_DIRECTORY | O_PATH);
+  if (cwd_fd < 0)
+    die("open: %m");
+
+  if (syscall(SYS_quotactl_fd, cwd_fd, quota_op, box_uid, dq_ptr) < 0)
+    quotactl_error();
+
+  close(cwd_fd);
+
+  msg("Quota: Set block quota %d and inode quota %d\n", block_quota, inode_quota);
 }
